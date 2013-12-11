@@ -1,0 +1,960 @@
+#!/usr/bin/env perl
+################################################################################
+# ibrun - SDSC's re-implementation of the ibrun wrapper for the various MPI
+#         launchers
+#
+# Glenn K. Lockwood, San Diego Supercomputer Center             December 2013
+################################################################################
+
+use strict;
+use warnings;
+use Sys::Hostname;
+use Getopt::Long;
+use POSIX;
+use Pod::Usage;
+use constant CONTACT => 'Contact help@xsede.org for additional assistance.';
+
+our $options; 
+
+### Define some parameters to impose on all MPI jobs unless user overrides
+$options->{mpi_srq_size}        = 2048;
+$options->{mpi_default_timeout} = 23;
+$options->{env_hacks}->{mvapich2} = {
+    MV2_USE_UD_HYBRID => 0,
+    MV2_USE_OLD_BCAST => 1,
+    MV2_HOMOGENEOUS_CLUSTER => 0,
+    MV2_USE_HUGEPAGES => 0,
+    MV2_DEFAULT_TIME_OUT => $options->{mpi_default_timeout},
+};
+$options->{env_hacks}->{openmpi} = {
+    OMPI_MCA_btl => 'self,sm,openib',
+    OMPI_MCA_btl_openib_use_srq => 1,
+    OMPI_MCA_btl_openib_ib_timeout => $options->{mpi_default_timeout},
+    OMPI_MCA_btl_openib_use_rd_max => $options->{mpi_srq_size},
+};
+$options->{env_hacks}->{mpich} = {
+    # nothing here
+};
+
+### Machine-specific stuff
+{
+    my $hostname = hostname();
+    if ( $hostname =~ m/^(gcn-|gordon-)/ ) { 
+        $options->{sys_pps}         = 8;        # sockets per node
+        $options->{sys_ppn}         = 16;       # cores per node
+        $options->{sys_max_nodes}   = 128;      # max nodes per job
+        $options->{sys_rm}          = 'Torque'; # resource manager
+    }
+    elsif ( $hostname =~ m/^trestles-/ ) {
+        $options->{sys_pps}         = 8;
+        $options->{sys_ppn}         = 32;
+        $options->{sys_max_nodes}   = 32;
+        $options->{sys_rm}          = 'Torque';
+    }
+    elsif ( $hostname =~ m/^tscc-/ ) {
+        $options->{sys_pps}         = 8;
+        $options->{sys_ppn}         = 16;
+        $options->{sys_max_nodes}   = 9999999;
+        $options->{sys_rm}          = 'Torque';
+    }
+    else {
+        # bailout( -1, "ibrun is running on an unknown system." );
+        $options->{sys_pps}         = 8;
+        $options->{sys_ppn}         = 32;
+        $options->{sys_max_nodes}   = 32;
+        $options->{sys_rm}          = 'Torque';
+    }
+}
+
+### Pull in default options from the resource manager
+if ( $options->{sys_rm} eq 'Torque' ) {
+    $options->{rm_nodefile} = $ENV{PBS_NODEFILE};
+    $options->{rm_num_nodes}= $ENV{PBS_NUM_NODES};
+    $options->{rm_ppn}      = $ENV{PBS_NUM_PPN};
+    $options->{rm_jobid}    = $ENV{PBS_JOBID};
+}
+elsif ( $options->{sys_rm} eq 'Slurm' ) {
+    bailout(-1, "This feature is not yet available.\n", $options )
+}
+elsif ( $options->{sys_rm} eq 'SGE' ) {
+    bailout(-1, "This feature is not yet available.\n", $options )
+}
+elsif ( $options->{sys_rm} eq 'LSF' ) {
+    bailout(-1, "This feature is not yet available.\n", $options )
+}
+else {
+    bailout(-1, "Unknown resource manager.");
+}
+$options->{rm_num_ranks}= $options->{rm_num_nodes} * $options->{rm_ppn} if $options->{rm_num_nodes};
+
+### Let command-line options override the defaults defined above
+$options = get_options( \@ARGV );
+$options->{cmd} = shift(@ARGV);
+$options->{cmd_args} = \@ARGV;
+if ( ! $options->{cmd} ) {
+    pod2usage( -verbose => 1 );
+}
+
+### Determine MPI stack to be used
+{
+    if ( $ENV{LOADEDMODULES} ) {
+        my @modules = split( m/:/, $ENV{LOADEDMODULES} );
+        foreach my $module ( @modules ) {
+            my ($modname, $modvers) = split(m{/}, $module);
+            if ( $modname eq 'mvapich2_ib' 
+            ||   $modname eq 'mv2profile_ib' ) {
+                $options->{mpi_stack} = "mvapich2";
+                $options->{mpi_launcher} = "mpirun_rsh";
+                $options->{mpi_version} = $modvers;
+                last;
+            }
+            elsif ( $modname eq 'openmpi_ib' ) {
+                $options->{mpi_stack} = "openmpi";
+                $options->{mpi_launcher} = "orterun";
+                $options->{mpi_version} = $modvers;
+                last;
+            }
+            elsif ( $modname =~ m/mpich2_ib/ ) {
+                $options->{mpi_stack} = "mpich2";
+                $options->{mpi_launcher} = "mpiexec.hydra";
+                $options->{mpi_version} = $modvers;
+                last;
+            }
+        }
+        unless ( $options->{mpi_stack} ) {
+            bailout(5, "No recognized MPI modules appear to be loaded.  Load an MPI module before using ibrun.\n" );
+        }
+    }
+    else {
+        bailout(5, "\$LOADEDMODULES is not set.  You must load an MPI module before using ibrun.\n" );
+    }
+}
+
+### Build the nodefile for this MPI job
+gen_nodefile( );
+dprintf( "Nodefile is %s\n", $options->{nodefile} );
+
+### Set a sensible binding policy
+check_cpu_binding( );
+
+### Construct the appropriate MPI launcher command line
+my @cmd = gen_mpirun_cmd( );
+dprintf( "Command string is [%s]\n", join(' ', @cmd) );
+
+### Don't pull the trigger if we're doing a dry run
+if ( ! $options->{dryrun} ) {
+    system( @cmd );
+
+    if ( $? == -1 ) {
+        dprintf( "Failed to execute: $!\n" );
+    }
+    elsif ( $? & 127 ) {
+        dprintf( "Job died with signal %d, %s core dump\n",
+            ( $? & 127 ), (( $? & 128 ) ? 'with' : 'without') );
+    }
+    else {
+        dprintf( "Job ended with value %d\n", $? >> 8 );
+    }
+}
+
+### Delete the temporary nodefile
+if ( $options
+&&   $options->{rm_nodefile}
+&&   $options->{nodefile}
+&&   $options->{nodefile} ne $options->{rm_nodefile}
+&&   -e $options->{nodefile} )
+{
+    unlink $options->{nodefile};
+}
+
+
+################################################################################
+### load_nodefile: Load nodelist from nodefile into an array and return it
+################################################################################
+sub load_nodefile
+{
+    my $nodefile = shift;
+    if ( ! $nodefile ) {
+        bailout( 1, "Unable to determine nodefile from resource manager.\n");
+    }
+    open( NODEFILE, $nodefile) or bailout( 1, "Unable to open nodefile $nodefile.\n");
+
+    my @nodelist;
+    
+    while ( my $line = <NODEFILE> )
+    {
+        $line =~ m/^\s*(\S+)\s*$/;
+        push( @nodelist, $1 );
+    }
+    return @nodelist;
+}
+
+################################################################################
+### gen_nodefile: Rebuild a nodefile based on user input, return its location.
+###     This subroutine assumes that num_nodes, npernode are either well-
+###     defined, or npernode is negative, num_nodes is well-defined and npernode
+###     needs to be recalculated here
+################################################################################
+sub gen_nodefile
+{
+    use File::Temp;
+
+    ### Load nodelist into an array
+    my @nodelist;
+    if ( $options->{nodefile} ) { # user-defined nodefile trumps RM nodefile
+        @nodelist = load_nodefile( $options->{nodefile} );
+    }
+    else {
+        @nodelist = load_nodefile( $options->{rm_nodefile} );
+    }
+    $options->{nodelist} = \@nodelist;
+
+    ### If the user is running a normal job (each MPI rank corresponds to a
+    ### single MPI process on a single core), just bypass all this extra 
+    ### work and just use the nodefile from the resource manager (rm_nodefile)
+    if ( ($options->{num_nodes} * $options->{npernode}) == ($options->{rm_num_nodes} * $options->{rm_ppn}) )
+    {
+        dprintf("no hostfile mod needed\n");
+        $options->{nodefile} = $options->{rm_nodefile};
+        $options->{tpr} = 1 unless $options->{tpr};
+        return;
+    }
+    
+    ### Otherwise, we need to reconstruct the nodefile.  Start by creating a new
+    ### temporary file...
+    my ($fh, $filename) = File::Temp::tempfile();
+
+    my $npernode = $options->{npernode};
+    my @my_npernode;
+    $options->{my_npernode} = \@my_npernode;
+
+    #### Convert nodelist into a list of unique nodes with order preserved
+    my @unique_nodes;
+    foreach my $node ( @nodelist ) {
+        push( @unique_nodes, $node ) unless grep {$_ eq $node} @unique_nodes;
+    }
+    $options->{unique_nodes} = \@unique_nodes;
+
+    ### Make sure the nodelist contains the same number of nodes as the 
+    ### resource manager says it should contain
+    if ( scalar(@unique_nodes) != $options->{rm_num_nodes} ) {
+        close($fh);
+        bailout( -5, sprintf( "Assert failed: #nodes (%d) in nodefile "
+            ."(%s) inconsistent with nodecount (%d) from %s.\n",
+            scalar(@unique_nodes),
+            $options->{rm_nodefile},
+            $options->{rm_num_nodes} ),
+            $options);
+    }
+
+    ### Make sure the user isn't requesting more nodes that he or she was given
+    if ( scalar(@unique_nodes) < $options->{num_nodes} )
+    {
+        close($fh);
+        bailout( 4, 
+            sprintf("Your MPI job requested %d nodes but %s only provided %d.\n",
+            $options->{num_nodes}, $options->{sys_rm}, scalar(@unique_nodes) ),
+            $options);
+    }
+
+    # -N supercedes the number of nodes given by the batch system
+    my $nodes_to_use = $options->{num_nodes};
+
+    # Positive npernode means npernode divides evenly into num_nodes.  Just 
+    # print $npernode copies per node into the new nodefile.
+    if ( $npernode > 0 )
+    {
+        dprintf( "Even number of ranks per node (%d)--hacking nodefile...\n",
+            $npernode );
+        @my_npernode = ($npernode) x $options->{num_nodes};
+        $options->{tpr} = $options->{rm_ppn} / $npernode unless $options->{tpr};
+    }
+    # Negative npernode means npernode does not divide evenly into num_nodes.
+    # We need to figure out what npernode should be on each node.  This also
+    # suggests that the job geometry is not meant to logically map to the 
+    # available cores per node, so we assume threads per rank (tpr) = 1 unless
+    # the user explicitly says otherwise
+    elsif ( $npernode < 0 )
+    {
+        dprintf( "Variable number of ranks per node--hacking nodefile...\n" );
+        $npernode = abs($npernode);
+        @my_npernode = ($npernode) x $options->{num_nodes};
+        my $num_ranks = $options->{num_ranks};
+        my $num_nodes = $options->{num_nodes};
+        
+        # figure out which nodes need to take up the slack
+        dprintf( "remainder is %d = %d - %d * %d\n", 
+            ($num_ranks - $num_nodes * $npernode),
+            $num_ranks,
+            $num_nodes,
+            $npernode );
+        foreach my $i ( 0 .. ($options->{num_nodes}-1) )
+        {
+            $my_npernode[$i]++ if $i < ($num_ranks - $num_nodes * $npernode);
+        }
+        $options->{tpr} = 1 unless $options->{tpr};
+    }
+
+    ### Convert our nodelist and my_npernode into nodefiles
+    dprintf("Running on %d unique nodes\n", $nodes_to_use);
+    foreach my $i ( 0 .. ($nodes_to_use-1) )
+    {
+        dprintf( "Will place %d ranks on %s with %d threads each\n", 
+            $my_npernode[$i], 
+            $unique_nodes[$i], 
+            $options->{tpr} );
+        foreach ( 1 .. $my_npernode[$i] )
+        {
+            print $fh $unique_nodes[$i] . "\n";
+        }
+    }
+    close($fh);
+
+    $options->{nodefile} = $filename;
+    return;
+}
+
+################################################################################
+### check_cpu_binding: examine tpr (threads per rank) and job geometry, then
+###   either set a sensible binding policy or warn that there is no sensible
+###   binding policy
+################################################################################
+sub check_cpu_binding {
+    if ( $ENV{OMP_NUM_THREADS} && $ENV{OMP_NUM_THREADS} != $options->{tpr} )
+    {
+       ibrun_warn( 
+            "Your job geometry appears to suggest that you want %d "
+            ."threads per MPI rank, but your OMP_NUM_THREADS is %d.  This will "
+            ."cause thread binding to be disabled.\n",
+            $options->{tpr}, $ENV{OMP_NUM_THREADS} );
+        $options->{tpr} = -1;
+    }
+
+    ### Now set most sensible binding policy and level based on job geometry
+    if ( $options->{tpr} == 1 ) {
+        $options->{def_binding_policy}  = 'scatter';    # best memory bandwidth
+        $options->{def_binding_level}   = 'core';
+    }
+    elsif ( $options->{tpr} == $options->{sys_pps} ) {  # best memory locality
+        $options->{def_binding_policy}  = 'scatter';
+        $options->{def_binding_level}   = 'socket';
+    }
+    elsif ( $options->{tpr} > 0 ) {                     # do the best we can
+        $options->{def_binding_policy}  = 'illogical';
+        $options->{def_binding_level}   = 'arbitrary';
+    }
+    else {                                              # no idea what usr wants
+        $options->{def_binding_policy}  = 'none';
+        $options->{def_binding_level}   = 'off';
+    }
+
+    ### Set these recommended settings if user hasn't overridden them
+    if ( !$options->{binding_policy} ) {
+        $options->{binding_policy} = $options->{def_binding_policy};
+    }
+    if ( !$options->{binding_level} ) {
+        $options->{binding_level} = $options->{def_binding_level};
+    }
+
+    ### the 'illogical' setting needs extra error checking because it is, by
+    ### definition, illogical.  We will want to bind each MPI rank to a sequence
+    ### of <#threads> cores regardless of whether or not that sequence of cores
+    ### crosses a numa boundary.  Performance may be unpredictable, but it is
+    ### often preferred to letting ranks and threads run wild
+    if ( $options->{binding_policy} eq 'illogical' 
+    &&   ($options->{tpr} * $options->{npernode}) > $options->{rm_ppn} )
+    {
+        ibrun_warn( "You requested %d cores per node but will run %d "
+        . "(%d MPI ranks * %d threads) per node.  This will cause thread "
+        . "binding to be disabled.\n",
+            $options->{rm_ppn},
+            $options->{tpr}*$options->{npernode},
+            $options->{npernode},
+            $options->{tpr} );
+        $options->{binding_policy} = 'none';
+        $options->{binding_level} = 'off';
+    }
+
+    dprintf( "MPI binding policy: %s/%s for %d threads per rank (%d cores per socket)\n", 
+        $options->{binding_policy},
+        $options->{binding_level},
+        $options->{tpr},
+        $options->{sys_pps} );
+
+    return;
+}
+
+################################################################################
+### gen_mpirun_cmd: Generate the actual "mpirun -n X ..." line to be executed
+################################################################################
+sub gen_mpirun_cmd
+{
+    my $launch_cmd;
+
+    my $mpi_stack = $options->{mpi_stack};
+
+    # Load the env variables we want to hack in for our specific MPI stack
+    my $env_hacks;
+    if ( $options->{env_hacks}->{$mpi_stack} ) { 
+        $env_hacks = $options->{env_hacks}->{$mpi_stack};
+    }
+
+    ### MVAPICH2 ###############################################################
+    if ( $options->{mpi_stack} eq "mvapich2" )
+    {
+        # Generate binding policy settings
+        if ( $options->{binding_policy} eq 'none'
+        ||   $options->{binding_level} eq 'none' ) 
+        {
+            $env_hacks->{MV2_ENABLE_AFFINITY} = 0;
+        }
+        elsif ( $options->{binding_policy} eq 'illogical' ) 
+        {
+            # 'illogical' binding_policy is always accompanied by 'arbitrary' as
+            # the binding_level
+            use List::Util;
+            my $npernode = List::Util::max(@{$options->{my_npernode}});
+            my $binding_str = "";
+            my $core = 0;
+            for my $i ( 1 .. $npernode ) {
+                $binding_str .= ":" unless $i == 1;
+                $binding_str .= sprintf( "%d-", $core );
+                $core += $options->{tpr};
+                $binding_str .= sprintf( "%d", $core-1 );
+            }
+            $env_hacks->{MV2_ENABLE_AFFINITY} = 1;
+            $env_hacks->{MV2_CPU_MAPPING} = $binding_str;
+        }
+        else 
+        {
+            $env_hacks->{MV2_ENABLE_AFFINITY} = 1;
+            if ( $options->{binding_policy} eq 'scatter' ) {
+                $env_hacks->{MV2_CPU_BINDING_POLICY} = 'scatter';
+            }
+            elsif ( $options->{binding_policy} eq 'compact' ) {
+                $env_hacks->{MV2_CPU_BINDING_POLICY} = 'bunch';
+            }
+            else {
+                $env_hacks->{MV2_ENABLE_AFFINITY} = 0;
+            }
+    
+            if ( $options->{binding_level} eq 'socket' ) {
+                $env_hacks->{MV2_CPU_BINDING_LEVEL} = 'socket';
+            }
+            elsif ( $options->{binding_level} eq 'core' ) {
+                $env_hacks->{MV2_CPU_BINDING_LEVEL} = 'core';
+            }
+            elsif ( $options->{binding_level} eq 'numanode' ) {
+                $env_hacks->{MV2_CPU_BINDING_LEVEL} = 'numanode';
+            }
+            else {
+                $env_hacks->{MV2_ENABLE_AFFINITY} = 0;
+            }
+        }
+
+        # Build mpirun command and environment variable injection
+        if ( $options->{mpi_launcher} eq 'mpirun_rsh' )
+        {
+
+            $launch_cmd = "mpirun_rsh";
+            add_mpirun_switches( sprintf( "-np %d", $options->{num_ranks} ) );
+            add_mpirun_switches( sprintf( "-hostfile %s", $options->{nodefile} ) );
+            add_mpirun_switches( '-export' );
+        }
+        elsif ( $options->{mpi_launcher} eq 'mpiexec.hydra' )
+        {
+            $launch_cmd .= "mpiexec.hydra";
+            add_mpirun_switches( sprintf( "-np %d", $options->{num_ranks} ) );
+            add_mpirun_switches( sprintf( "-hostfile %s", $options->{nodefile} ) );
+        }
+        else
+        {
+            bailout( 2, "Unknown/undefined MPI launcher.\n", $options );
+        }
+    }
+
+    ### OPENMPI ################################################################
+    elsif ( $options->{mpi_stack} eq "openmpi" )
+    {
+        # Generate binding policy settings
+        if (($options->{binding_policy} && $options->{binding_policy} eq 'none')
+        ||  ($options->{binding_level} && $options->{binding_level} eq 'none')) {
+            add_mpirun_switches( '--bind-to-none' );
+        }
+        elsif ( $options->{binding_policy} eq 'illogical' ) {
+            add_mpirun_switches( '--bind-to-core' );
+            add_mpirun_switches( sprintf( '--cpus-per-proc %d', $options->{tpr} ) );
+        }
+        else {
+            if ( $options->{binding_policy} eq 'scatter' ) {
+                add_mpirun_switches( '--bysocket' );
+            }
+            elsif ( $options->{binding_policy} eq 'compact' ) {
+                add_mpirun_switches( '--bycore' );
+            }
+            else {
+                add_mpirun_switches( '--bind-to-none' );
+            }
+    
+            if ( $options->{binding_level} eq 'socket' ) {
+                add_mpirun_switches( '--bind-to-socket' );
+            }
+            elsif ( $options->{binding_level} eq 'core' ) {
+                add_mpirun_switches( '--bind-to-core' );
+            }
+            elsif ( $options->{binding_level} eq 'numanode' ) {
+                if ( $options->{mpi_version} =~ m/(\d\.\d+)/ ) {
+                    my $ompi_vers = $1;
+                    bailout( 5, "OpenMPI does not support numanode binding until version 1.7.\n" ) if $ompi_vers < 1.7;
+                }
+                add_mpirun_switches( '--bind-to-numa' );
+            }
+            else {
+                add_mpirun_switches( '--bind-to-none' );
+            }
+        }
+
+        # Build mpirun command and environment variable injection
+        $launch_cmd .= "orterun";
+        add_mpirun_switches( sprintf( "-n %d", $options->{num_ranks} ) );
+        add_mpirun_switches( sprintf( "-machinefile %s", $options->{nodefile} ) );
+    }
+
+    ### MPICH2 #################################################################
+    elsif ( $options->{mpi_stack} eq "mpich2" )
+    {
+        bailout(-1, "This feature is not yet available.\n", $options )
+    }
+    else
+    {
+        bailout(2, sprintf( "Unknown MPI stack '%s'.\n",
+            ($options->{mpi_stack} ? $options->{mpi_stack} : "????")),
+            $options );
+    }
+
+    ### Actually apply our $env_hacks to the ibrun environment.  Also save
+    ### the shell-parseable string to do the same thing (for future use)
+    my $env_str = gen_env($env_hacks);
+
+    return ( $launch_cmd, @{$options->{mpirun_switches}}, $options->{cmd}, @{$options->{cmd_args}} ) ;
+}
+
+################################################################################
+### gen_env: Subroutine to turn a hash into an environment variable assignment 
+### string.  Doesn't overwrite values from the hash is the user already set them
+################################################################################
+sub gen_env
+{
+    my $hash = shift;
+    my ( $mods, $output_str ) = (0,  "");
+    %$hash = ( $options->{ibrun_env}, %$hash ) if $options->{ibrun_env};
+
+    ### only set environment variables that user hasn't already set
+    foreach my $key ( keys(%$hash) ) 
+    {
+        if ( ! $ENV{$key} ) 
+        {
+            # Generate a shell-understandable string for certain mpi launchers
+            $output_str .= " " if $mods++ > 0;
+            $output_str .= sprintf( "%s=%s", $key, $hash->{$key} );
+            dprintf( "Adding %s=%s to the environment\n", $key, $hash->{$key} );
+
+            # Add environment variable to our execution environment
+            $ENV{$key} = $hash->{$key};
+        }
+    }
+    dprintf( "Added %d new environment variables to the execution environment\n", $mods );
+    return $output_str;
+}
+################################################################################
+### add_mpirun_switch: append the input parameter to the mpi launcher command's
+### arguments
+################################################################################
+sub add_mpirun_switches
+{
+    my @args = @_;
+    my @switches;
+    foreach my $arg ( @args )
+    {
+        if ( $arg =~ m/^(-\S+)(\s+|=)(.*)/ ) {
+            push( @{$options->{mpirun_switches}}, $1, $3 );
+        }
+        else {
+            push (@{$options->{mpirun_switches}}, $arg );
+        }
+    }
+#   $options->{mpirun_switches} .= $_ . " " foreach @_;
+}
+
+################################################################################
+### get_options: Parse command line input and check for errors.  This will be 
+### called AFTER the resource manager's paramaters have already been loaded into
+### the options hash.
+################################################################################
+sub get_options
+{
+    my $argv = shift;
+    my $old_options = $options;
+    my %new_options;
+    use Getopt::Long;
+    Getopt::Long::Configure( "require_order", "no_ignore_case", 
+                            "auto_version", "auto_help", "no_auto_abbrev" );
+    if ( @$argv > 0 ) 
+    {
+        GetOptions(
+            "o=i"           =>  \$new_options{nodefile_offset},
+            "no=i"          =>  \$new_options{node_offset},
+            "N=i"           =>  \$new_options{num_nodes},
+            "n|np=i"        =>  \$new_options{num_ranks}, 
+            "tpr|tpp|threads-per-rank|threads-per-process=i"  => \$new_options{tpr}, 
+            "npernode=i"    =>  \$new_options{npernode},
+            "switches=s"    =>  \$new_options{user_mpirun_switches},
+            "bp|binding-policy=s"  =>  \$new_options{binding_policy},
+            "bl|binding-level=s"   =>  \$new_options{binding_level},
+            "nodefile|machinefile=s"    => \$new_options{nodefile},
+            "dryrun"        => \$new_options{dryrun},
+            "v|verbose"     => \$new_options{verbose},
+        );
+    }
+
+    ### Check the consistency of user-provided options before doing anything
+    #
+    # Hybrid jobs (those which do not run one MPI rank per core) can be 
+    # specified in several ways:
+    #
+    #   1. Specifying -N and -n (a la Slurm)
+    #   2. Specifying -N and -npernode (a la OpenMPI)
+    #   3. Just -n (let the RM pick up the -N)
+    #   4. Just -npernode (let the RM pick up the -N)
+    #   5. Specifying -n and -tpr (hope that n*tpr < N*ppn)
+    #
+    #   Thus, if neither -npernode nor -n are provided, this is not a hybrid 
+    # job.  In all cases, rm_num_ranks should probably be ignored.  As long as
+    # we can gaurantee that num_nodes and npernode are defined by the end of
+    # get_options(), we can calculate num_ranks.
+    #
+    #   In the event that npernode is negative (i.e., not all nodes have the
+    # same loading due to num_ranks%npernode != 0), num_ranks is already 
+    # defined by the user so it would be safe to carry that value forward
+    # without recalculating.
+    #
+    if ( $new_options{num_ranks}
+    &&   $new_options{num_nodes}
+    &&   $new_options{npernode}
+    &&   ($new_options{num_nodes}*$new_options{npernode}) != $new_options{num_ranks} ) {
+        bailout( 1, "Either provide -N and -n OR -N and --npernode.\n" );
+    }
+    if ( $new_options{npernode}
+    &&   $new_options{num_ranks} )
+    {
+        bailout( 1, "Either provide -n OR --npernode, but not both.\n" );
+    }
+
+    # Check offset arguments to maintain compatibility with TACC's ibrun 
+    # implementation.  Also added a per-node offset
+    if ( $new_options{nodefile_offset}
+    && ( ($new_options{num_ranks} && $new_options{nodefile_offset} >= $new_options{num_ranks})
+    ||   $new_options{nodefile_offset} < 0) ) {
+        bailout( 1, "Your nodefile offset (-o) must be between 0 and (n-1).\n" );
+    }
+    if ( $new_options{node_offset}
+    && ( ( $new_options{num_nodes}
+    &&   $new_options{node_offset} >= $new_options{num_nodes})
+    ||   $new_options{node_offset} < 0 ) ) {
+        bailout( 1, "Your node offset (-no) must be between 0 and (N-1).\n" );
+    }
+
+    # Make sure user did not entire anything that is numerically nonsensical
+    if ( $new_options{num_nodes} && $new_options{num_nodes} <= 0 ) {
+        bailout( 1, "Your number of nodes (-N) must be greater than zero.\n" );
+    }
+    if ( $new_options{num_ranks} && $new_options{num_ranks} <= 0 ) {
+        bailout( 1, "Your number of ranks (-n) must be greater than zero.\n" );
+    }
+    if ( $new_options{npernode} && $new_options{npernode} <= 0 ) {
+        bailout( 1, "Your ranks per node (--npernode) must be greater than zero.\n" );
+    }
+    if ( $new_options{tpr} && $new_options{tpr} <= 0 ) {
+        bailout( 1, "Your threads per rank (-tpr) must be greater than zero.\n" );
+    }
+
+    # Check for a valid binding policy/level
+    if ( $new_options{binding_policy} ) {
+        my %valid = (
+            'scatter'   => 'scatter',
+            'rr'        => 'scatter',
+            'compact'   => 'compact',
+            'bunch'     => 'compact',
+            'none'      => 'none',
+            'off'       => 'none', );
+        if ( !$valid{$new_options{binding_policy}} ) {
+            bailout(1, "Invalid binding policy.  Valid policies are "
+            . join( ' ', reverse(keys(%valid)) ) . ".\n" );
+        }
+        else {
+            $new_options{binding_policy} = $valid{$new_options{binding_policy}};
+        }
+    }
+    if ( $new_options{binding_level} ) {
+        my %valid = (
+            'core'      => 'core',
+            'socket'    => 'socket',
+            'numanode'  => 'numanode',
+            'numa'      => 'numanode',
+            'none'      => 'none',
+            'off'       => 'none');
+        if ( !$valid{$new_options{binding_level}} ) {
+            bailout(1, "Invalid binding level.  Valid level are "
+            . join( ' ', reverse(keys(%valid)) ) . ".\n" );
+        }
+        else {
+            $new_options{binding_level} = $valid{$new_options{binding_level}};
+        }
+    }
+
+
+    # Merge in the user-provided values with the pre-set values.  Overwrite old
+    # pre-set values with user-provided when duplicates occur.
+    my %options = ( %$old_options, %new_options );
+
+    ### If user did not specify certain parameters, copy the values from what
+    ### the resource manager (rm) provided
+    # this job should skip the first X entries in the nodefile
+    if ( !$options{nodefile_offset} ) { 
+        dprintf( "Using default nodefile_offset for now...\n" );
+        $options{nodefile_offset} = 0; 
+    }
+
+    # this job should skip the first X unique nodes in the nodefile
+    if ( !$options{node_offset} ) {
+        dprintf( "Using default node_offset for now...\n" );
+        $options{node_offset} = 0;
+    }
+
+    # how many nodes the job will use
+    if ( !$options{num_nodes} ) {
+        if ( !$options{rm_num_nodes} ) {
+            bailout(1, "Unable to obtain number of nodes from resource "
+            . "manager and -N not given.\n" );
+        }
+        else {
+            dprintf( "Using default num_nodes for now...\n" );
+            $options{num_nodes} = $options{rm_num_nodes}
+        }
+    }
+
+    # how many MPI ranks total the job will use
+    if ( !$options{num_ranks} ) {
+        if ( $options{num_nodes} == $options{rm_num_nodes} ) {
+            dprintf( "Using default num_ranks for now...\n" );
+            $options{num_ranks} = $options{rm_num_ranks};
+        }
+        # if user provides -N but nothing else, assume she wants all all cores
+        # on those nodes (e.g., for a node_offset job)
+        elsif ( !$options{npernode} ) {
+            dprintf( "Assuming num_ranks = num_nodes * rm_ppn\n" );
+            $options{num_ranks} = $options{num_nodes} * $options{rm_ppn};
+        }
+    }
+
+    # how many MPI ranks PER NODE the job will use.  If this is NEGATIVE, then 
+    # the division is uneven and the node breakdown requires a lot more logic,
+    # so flag the npernode parameter and let gen_hostfile() do that
+    my $remainder = $options{num_ranks} % $options{num_nodes};
+    if ( !$options{npernode} )
+    {
+        dprintf( "Calculating proper npernode since -npernode wasn't defined...\n" );
+        if ( $remainder == 0 ) {
+            $options{npernode} = $options{num_ranks} / $options{num_nodes};
+        }
+        else {
+            $options{npernode} = -1 * floor($options{num_ranks} 
+                                    / $options{num_nodes});
+        }
+    }
+    elsif ( $remainder != 0 ) {
+        dprintf( "Calculating proper npernode due to uneven division of numranks/numnodes...\n" );
+        $options{npernode} = -1 * floor($options{num_ranks} 
+                                / $options{num_nodes});
+    }
+    # recalculate num_ranks in case user specified -N which is less than 
+    # rm_num_nodes.  if npernode is negative though, leave it alone since
+    # an imbalance of ranks per node can only occur if the user specified
+    # num_ranks explicitly already
+    if ( $options{npernode} > 0 ) {
+        my $recalculated_ranks = $options{num_nodes} * $options{npernode};
+        if ( $options{num_ranks} != $recalculated_ranks ) {
+            dprintf( "Will use %d ranks instead of the previous %d\n",
+                $recalculated_ranks,
+                $options{num_ranks} );
+        }
+        $options{num_ranks} = $recalculated_ranks;
+    }
+
+    ### Check the sanity of the inputted parameters
+    if ( $options{npernode} > $options{sys_ppn} ) 
+    {
+        # don't bail here; some codes have a lightweight management rank that 
+        # in addition to the one-rank-per-core compute ranks
+        ibrun_warn(
+            "Your job will put more ranks on each node (%d) than the "
+            ."cores physically available to each node (%d)\n",
+            $options{npernode}, $options{sys_ppn} );
+    }
+
+    if ( $options{num_nodes} > $options{sys_max_nodes} )
+    {
+        bailout(3, sprintf("Your job requests more nodes (%d) than the "
+            ."maximum allowed per job (%d).\n",
+            $options{num_nodes},
+            $options{sys_max_nodes} ),
+            $options);
+    }
+
+    if ( $options{tpr} 
+    &&  ($options{num_ranks}*$options{tpr}) 
+            > ($options{num_nodes}*$options{rm_ppn}) ) 
+    {
+        ibrun_warn("Your job will use %d ranks, "
+        . "each with %d threads (%d total), but only requested %d nodes "
+        . "and %d cores per node (%d total).  Some cores will be "
+        . "overloaded as a result.\n",
+            $options{num_ranks},
+            $options{tpr},
+            $options{num_ranks}*$options{tpr},
+            $options{num_nodes},
+            $options{rm_ppn}, 
+            $options{num_nodes}*$options{rm_ppn});
+
+    }
+
+    ### Add mpirun_switches
+    if ( $options{user_mpirun_switches} ) {
+        add_mpirun_switches( split( m/\s+/, $options{user_mpirun_switches} ) );
+    }
+
+    ### at this point, num_ranks, num_nodes, and npernode are guaranteed to 
+    ### exist and be well-defined at this point
+    return \%options;
+}
+
+################################################################################
+### bailout: terminate with an error and optionally delete the temporary 
+### nodefile created by ibrun
+################################################################################
+sub bailout
+{
+    my $errno = shift;
+    my $errmsg = shift;
+    print STDERR "IBRUN ERROR: $errmsg\n" . CONTACT . "\n";
+
+    ### Delete temporary nodefile on error
+    if ( $options
+    &&   $options->{rm_nodefile}
+    &&   $options->{nodefile}
+    &&   $options->{nodefile} ne $options->{rm_nodefile}
+    &&  -e $options->{nodefile} )
+    {
+        unlink $options->{nodefile};
+    }
+
+    exit $errno;
+}
+sub ibrun_warn
+{
+    print STDERR "IBRUN WARNING: ";
+    printf( @_ );
+}
+
+################################################################################
+### dprintf: print messages if debugging is enabled
+################################################################################
+sub dprintf
+{
+    return unless $options->{verbose};
+    print "IBRUN: ";
+    printf( @_ );
+}
+
+__END__
+
+=head1 NAME
+
+ibrun - launch MPI jobs from an implementation-independent command
+
+=head1 SYNOPSIS
+
+ibrun [options] <executable> [executable args]
+
+ Options:
+    -n, -np <n>
+        launch n MPI ranks (default: use all cores provided by resource manager)
+
+    -o, --offset <n>
+        assign MPI ranks starting at the nth slot provided by the resource 
+        manager (default: 0)
+    
+    -no <n>
+        assign MPI ranks starting at the nth unique node provided by the 
+        resource manager (default: 0)
+    
+    --npernode <n>
+        only launch n MPI ranks per node (default: ppn from resource manager)
+
+    --tpr|--tpp|--threads-per-rank|--threads-per-process <n>
+        how many threads each MPI rank (often referred to as 'MPI process') 
+        will spawn.  (default: $OMP_NUM_THREADS (if defined), <ppn>/<npernode>
+        if ppn is divisible by npernode, or 1 otherwise)
+    
+    --switches '<implementation-specific switches>'
+        Pass additional command-line switches to the underlying implementation's
+        MPI launcher.  These WILL be overridden by any switches ibrun 
+        subsequently enables (default: none)
+    
+    -bp|--binding-policy <scatter|compact|none>
+        Define the CPU affinity's binding policy for each MPI rank.  'scatter' 
+        distributes ranks across each binding level, 'compact' fills up a 
+        binding level before allocating another, and 'none' disables all 
+        affinity settings (default: optimized for job geometry)
+    
+    -bl|--binding-level <core|socket|numanode|none>
+        Define the level of granularity for CPU affinity for each MPI rank.  
+        'core' binds each rank to a single core; 'socket' binds each rank to 
+        all cores on a single CPU socket (good for multithreaded ranks); 
+        'numanode' binds each rank to the subset of cores belonging to a
+        numanode; 'none' disables all affinity settings. (default: optimized 
+        for job geometry)
+
+    --dryrun
+        Do everything except actually launch the application
+
+    -v|--verbose
+        Print diagnostic messages
+    
+    -? 
+        Print this message
+
+=head1 DESCRIPTION
+
+This application launches an MPI job using a simple user interface that 
+automatically configures the implementation- and system-specific features on 
+whichever MPI stack the user wants to use.  Provides an administrator-
+configurable optimal set of settings as well as a best-guess binding 
+policy based on job geometry.
+
+=head1 KNOWN BUGS
+
+Currently the following features are not supported:
+* MPICH2 stack
+* VSMP nodes (SDSC Gordon) 
+* -o and -no options
+
+The following edge cases are not necessarily handled gracefully:
+* When -n is less than -N
+* When -n is 1
+
+=head1 AUTHOR
+
+Glenn K. Lockwood (glock@sdsc.edu)
+
+=cut
