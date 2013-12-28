@@ -25,6 +25,12 @@ The following edge cases are not necessarily handled gracefully:
 * When -n is less than -N
 * When -n is 1
 
+Features to Implement
+---------------------
+* completely separate the option detection for user input, resource manager, 
+  and internal guessing
+* provide stronger unification for the -tpp and -npernode option
+
 Author
 ------
 This application is currently maintained by Glenn K. Lockwood at the San Diego

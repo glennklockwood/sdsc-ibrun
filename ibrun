@@ -16,119 +16,75 @@ use constant CONTACT => 'Contact help@xsede.org for additional assistance.';
 
 our $options; 
 
-### Define some parameters to impose on all MPI jobs unless user overrides
-$options->{mpi_srq_size}        = 2048;
-$options->{mpi_default_timeout} = 23;
-$options->{env_hacks}->{mvapich2} = {
-    MV2_USE_UD_HYBRID => 0,
-    MV2_USE_OLD_BCAST => 1,
-    MV2_HOMOGENEOUS_CLUSTER => 0,
-    MV2_USE_HUGEPAGES => 0,
-    MV2_DEFAULT_TIME_OUT => $options->{mpi_default_timeout},
-};
-$options->{env_hacks}->{openmpi} = {
-    OMPI_MCA_btl => 'self,sm,openib',
-    OMPI_MCA_btl_openib_use_srq => 1,
-    OMPI_MCA_btl_openib_ib_timeout => $options->{mpi_default_timeout},
-    OMPI_MCA_btl_openib_use_rd_max => $options->{mpi_srq_size},
-};
-$options->{env_hacks}->{mpich} = {
-    # nothing here
-};
-
-### Machine-specific stuff
+### Machine-specific settings.  In the future, we should read this in from a
+###     system config file (e.g., /etc/ibrun.conf)
 {
     my $hostname = hostname();
     if ( $hostname =~ m/^(gcn-|gordon-)/ ) { 
         $options->{sys_pps}         = 8;        # sockets per node
         $options->{sys_ppn}         = 16;       # cores per node
         $options->{sys_max_nodes}   = 128;      # max nodes per job
-        $options->{sys_rm}          = 'Torque'; # resource manager
+        $options->{sys_rm}              = 'torque';
+        $options->{mpi_srq_size}        = 2048;
+        $options->{mpi_default_timeout} = 23;
     }
     elsif ( $hostname =~ m/^trestles-/ ) {
         $options->{sys_pps}         = 8;
         $options->{sys_ppn}         = 32;
         $options->{sys_max_nodes}   = 32;
-        $options->{sys_rm}          = 'Torque';
+        $options->{sys_rm}              = 'torque';
+        $options->{mpi_srq_size}        = 2048;
+        $options->{mpi_default_timeout} = 23;
     }
     elsif ( $hostname =~ m/^tscc-/ ) {
         $options->{sys_pps}         = 8;
         $options->{sys_ppn}         = 16;
         $options->{sys_max_nodes}   = 9999999;
-        $options->{sys_rm}          = 'Torque';
+        $options->{sys_rm}              = 'torque';
+        $options->{mpi_srq_size}        = 2048;
+        $options->{mpi_default_timeout} = 23;
     }
     else {
-        # bailout( -1, "ibrun is running on an unknown system." );
+        # bailout( -1, "ERROR: ibrun is running on an unknown system.  " . CONTACT );
         $options->{sys_pps}         = 8;
         $options->{sys_ppn}         = 32;
         $options->{sys_max_nodes}   = 32;
-        $options->{sys_rm}          = 'Torque';
+        $options->{sys_rm}              = 'torque';
+        $options->{mpi_srq_size}        = 2048;
+        $options->{mpi_default_timeout} = 23;
     }
 }
 
-### Pull in default options from the resource manager
-if ( $options->{sys_rm} eq 'Torque' ) {
-    $options->{rm_nodefile} = $ENV{PBS_NODEFILE};
-    $options->{rm_num_nodes}= $ENV{PBS_NUM_NODES};
-    $options->{rm_ppn}      = $ENV{PBS_NUM_PPN};
-    $options->{rm_jobid}    = $ENV{PBS_JOBID};
-}
-elsif ( $options->{sys_rm} eq 'Slurm' ) {
-    bailout(-1, "This feature is not yet available.\n", $options )
-}
-elsif ( $options->{sys_rm} eq 'SGE' ) {
-    bailout(-1, "This feature is not yet available.\n", $options )
-}
-elsif ( $options->{sys_rm} eq 'LSF' ) {
-    bailout(-1, "This feature is not yet available.\n", $options )
-}
-else {
-    bailout(-1, "Unknown resource manager.");
-}
-$options->{rm_num_ranks}= $options->{rm_num_nodes} * $options->{rm_ppn} if $options->{rm_num_nodes};
+### Implementation-specific hacks to optimize performance on this platform.
+$options->{env_hacks}->{mvapich2} = {
+    MV2_USE_UD_HYBRID           => 0,
+    MV2_USE_OLD_BCAST           => 1,
+    MV2_HOMOGENEOUS_CLUSTER     => 0,
+    MV2_USE_HUGEPAGES           => 0,
+    MV2_DEFAULT_TIME_OUT        => $options->{mpi_default_timeout},
+};
+$options->{env_hacks}->{openmpi} = {
+    OMPI_MCA_btl                    => 'self,sm,openib',
+    OMPI_MCA_btl_openib_use_srq     => 1,
+    OMPI_MCA_btl_openib_ib_timeout  => $options->{mpi_default_timeout},
+    OMPI_MCA_btl_openib_use_rd_max  => $options->{mpi_srq_size},
+    OMPI_MCA_btl_openib_if_exclude  => 'mlx4_1',
+};
+$options->{env_hacks}->{mpich} = {
+    # nothing here
+};
 
 ### Let command-line options override the defaults defined above
-$options = get_options( \@ARGV );
+$options = get_options_sys( );
+$options = get_options_user( \@ARGV );
+
+### The remaining contents of @ARGV are the application and its parameters
 $options->{cmd} = shift(@ARGV);
 $options->{cmd_args} = \@ARGV;
-if ( ! $options->{cmd} ) {
-    pod2usage( -verbose => 1 );
-}
+if ( ! $options->{cmd} ) { pod2usage( -verbose => 1 ); }
 
 ### Determine MPI stack to be used
-{
-    if ( $ENV{LOADEDMODULES} ) {
-        my @modules = split( m/:/, $ENV{LOADEDMODULES} );
-        foreach my $module ( @modules ) {
-            my ($modname, $modvers) = split(m{/}, $module);
-            if ( $modname eq 'mvapich2_ib' 
-            ||   $modname eq 'mv2profile_ib' ) {
-                $options->{mpi_stack} = "mvapich2";
-                $options->{mpi_launcher} = "mpirun_rsh";
-                $options->{mpi_version} = $modvers;
-                last;
-            }
-            elsif ( $modname eq 'openmpi_ib' ) {
-                $options->{mpi_stack} = "openmpi";
-                $options->{mpi_launcher} = "orterun";
-                $options->{mpi_version} = $modvers;
-                last;
-            }
-            elsif ( $modname =~ m/mpich2_ib/ ) {
-                $options->{mpi_stack} = "mpich2";
-                $options->{mpi_launcher} = "mpiexec.hydra";
-                $options->{mpi_version} = $modvers;
-                last;
-            }
-        }
-        unless ( $options->{mpi_stack} ) {
-            bailout(5, "No recognized MPI modules appear to be loaded.  Load an MPI module before using ibrun.\n" );
-        }
-    }
-    else {
-        bailout(5, "\$LOADEDMODULES is not set.  You must load an MPI module before using ibrun.\n" );
-    }
-}
+get_mpi_stack();
 
 ### Build the nodefile for this MPI job
 gen_nodefile( );
@@ -216,7 +172,7 @@ sub gen_nodefile
     {
         dprintf("no hostfile mod needed\n");
         $options->{nodefile} = $options->{rm_nodefile};
-        $options->{tpr} = 1 unless $options->{tpr};
+        $options->{tpp} = 1 unless $options->{tpp};
         return;
     }
     
@@ -267,12 +223,12 @@ sub gen_nodefile
         dprintf( "Even number of ranks per node (%d)--hacking nodefile...\n",
             $npernode );
         @my_npernode = ($npernode) x $options->{num_nodes};
-        $options->{tpr} = $options->{rm_ppn} / $npernode unless $options->{tpr};
+        $options->{tpp} = $options->{rm_ppn} / $npernode unless $options->{tpp};
     }
     # Negative npernode means npernode does not divide evenly into num_nodes.
     # We need to figure out what npernode should be on each node.  This also
     # suggests that the job geometry is not meant to logically map to the 
-    # available cores per node, so we assume threads per rank (tpr) = 1 unless
+    # available cores per node, so we assume threads per rank (tpp) = 1 unless
     # the user explicitly says otherwise
     elsif ( $npernode < 0 )
     {
@@ -292,7 +248,7 @@ sub gen_nodefile
         {
             $my_npernode[$i]++ if $i < ($num_ranks - $num_nodes * $npernode);
         }
-        $options->{tpr} = 1 unless $options->{tpr};
+        $options->{tpp} = 1 unless $options->{tpp};
     }
 
     ### Convert our nodelist and my_npernode into nodefiles
@@ -302,7 +258,7 @@ sub gen_nodefile
         dprintf( "Will place %d ranks on %s with %d threads each\n", 
             $my_npernode[$i], 
             $unique_nodes[$i], 
-            $options->{tpr} );
+            $options->{tpp} );
         foreach ( 1 .. $my_npernode[$i] )
         {
             print $fh $unique_nodes[$i] . "\n";
@@ -315,31 +271,31 @@ sub gen_nodefile
 }
 
 ################################################################################
-### check_cpu_binding: examine tpr (threads per rank) and job geometry, then
+### check_cpu_binding: examine tpp (threads per rank) and job geometry, then
 ###   either set a sensible binding policy or warn that there is no sensible
 ###   binding policy
 ################################################################################
 sub check_cpu_binding {
-    if ( $ENV{OMP_NUM_THREADS} && $ENV{OMP_NUM_THREADS} != $options->{tpr} )
+    if ( $ENV{OMP_NUM_THREADS} && $ENV{OMP_NUM_THREADS} != $options->{tpp} )
     {
        ibrun_warn( 
             "Your job geometry appears to suggest that you want %d "
             ."threads per MPI rank, but your OMP_NUM_THREADS is %d.  This will "
             ."cause thread binding to be disabled.\n",
-            $options->{tpr}, $ENV{OMP_NUM_THREADS} );
-        $options->{tpr} = -1;
+            $options->{tpp}, $ENV{OMP_NUM_THREADS} );
+        $options->{tpp} = -1;
     }
 
     ### Now set most sensible binding policy and level based on job geometry
-    if ( $options->{tpr} == 1 ) {
+    if ( $options->{tpp} == 1 ) {
         $options->{def_binding_policy}  = 'scatter';    # best memory bandwidth
         $options->{def_binding_level}   = 'core';
     }
-    elsif ( $options->{tpr} == $options->{sys_pps} ) {  # best memory locality
+    elsif ( $options->{tpp} == $options->{sys_pps} ) {  # best memory locality
         $options->{def_binding_policy}  = 'scatter';
         $options->{def_binding_level}   = 'socket';
     }
-    elsif ( $options->{tpr} > 0 ) {                     # do the best we can
+    elsif ( $options->{tpp} > 0 ) {                     # do the best we can
         $options->{def_binding_policy}  = 'illogical';
         $options->{def_binding_level}   = 'arbitrary';
     }
@@ -362,15 +318,15 @@ sub check_cpu_binding {
     ### crosses a numa boundary.  Performance may be unpredictable, but it is
     ### often preferred to letting ranks and threads run wild
     if ( $options->{binding_policy} eq 'illogical' 
-    &&   ($options->{tpr} * $options->{npernode}) > $options->{rm_ppn} )
+    &&   ($options->{tpp} * $options->{npernode}) > $options->{rm_ppn} )
     {
         ibrun_warn( "You requested %d cores per node but will run %d "
         . "(%d MPI ranks * %d threads) per node.  This will cause thread "
         . "binding to be disabled.\n",
             $options->{rm_ppn},
-            $options->{tpr}*$options->{npernode},
+            $options->{tpp}*$options->{npernode},
             $options->{npernode},
-            $options->{tpr} );
+            $options->{tpp} );
         $options->{binding_policy} = 'none';
         $options->{binding_level} = 'off';
     }
@@ -378,7 +334,7 @@ sub check_cpu_binding {
     dprintf( "MPI binding policy: %s/%s for %d threads per rank (%d cores per socket)\n", 
         $options->{binding_policy},
         $options->{binding_level},
-        $options->{tpr},
+        $options->{tpp},
         $options->{sys_pps} );
 
     return;
@@ -419,7 +375,7 @@ sub gen_mpirun_cmd
             for my $i ( 1 .. $npernode ) {
                 $binding_str .= ":" unless $i == 1;
                 $binding_str .= sprintf( "%d-", $core );
-                $core += $options->{tpr};
+                $core += $options->{tpp};
                 $binding_str .= sprintf( "%d", $core-1 );
             }
             $env_hacks->{MV2_ENABLE_AFFINITY} = 1;
@@ -483,7 +439,7 @@ sub gen_mpirun_cmd
         }
         elsif ( $options->{binding_policy} eq 'illogical' ) {
             add_mpirun_switches( '--bind-to-core' );
-            add_mpirun_switches( sprintf( '--cpus-per-proc %d', $options->{tpr} ) );
+            add_mpirun_switches( sprintf( '--cpus-per-proc %d', $options->{tpp} ) );
         }
         else {
             if ( $options->{binding_policy} eq 'scatter' ) {
@@ -566,6 +522,8 @@ sub gen_env
     dprintf( "Added %d new environment variables to the execution environment\n", $mods );
     return $output_str;
 }
+
+
 ################################################################################
 ### add_mpirun_switch: append the input parameter to the mpi launcher command's
 ### arguments
@@ -587,14 +545,32 @@ sub add_mpirun_switches
 }
 
 ################################################################################
-### get_options: Parse command line input and check for errors.  This will be 
-### called AFTER the resource manager's paramaters have already been loaded into
-### the options hash.
+### get_options_sys: Pull in default options from the resource manager
 ################################################################################
-sub get_options
+sub get_options_sys {
+    if ( $options->{sys_rm} eq 'torque' ) {
+        $options->{rm_nodefile} = $ENV{PBS_NODEFILE};
+        $options->{rm_num_nodes}= $ENV{PBS_NUM_NODES};
+        $options->{rm_ppn}      = $ENV{PBS_NUM_PPN};
+        $options->{rm_jobid}    = $ENV{PBS_JOBID};
+    }
+    elsif ( $options->{sys_rm} eq 'slurm' ) {
+        bailout( 1, "This feature is not yet available.\n", $options )
+    }
+
+    $options->{rm_num_ranks} = $options->{rm_num_nodes} * $options->{rm_ppn};
+    return $options;
+}
+
+################################################################################
+### get_options_user: Parse command line input and check for errors.  This will 
+###     be called AFTER the resource manager's paramaters have already been 
+###     loaded into the options hash.
+################################################################################
+sub get_options_user
 {
     my $argv = shift;
-    my $old_options = $options;
+    my %old_options = %$options;
     my %new_options;
     use Getopt::Long;
     Getopt::Long::Configure( "require_order", "no_ignore_case", 
@@ -602,36 +578,36 @@ sub get_options
     if ( @$argv > 0 ) 
     {
         GetOptions(
-            "o=i"           =>  \$new_options{nodefile_offset},
-            "no=i"          =>  \$new_options{node_offset},
-            "N=i"           =>  \$new_options{num_nodes},
-            "n|np=i"        =>  \$new_options{num_ranks}, 
-            "tpr|tpp|threads-per-rank|threads-per-process=i"  => \$new_options{tpr}, 
-            "npernode=i"    =>  \$new_options{npernode},
-            "switches=s"    =>  \$new_options{user_mpirun_switches},
-            "bp|binding-policy=s"  =>  \$new_options{binding_policy},
-            "bl|binding-level=s"   =>  \$new_options{binding_level},
-            "nodefile|machinefile=s"    => \$new_options{nodefile},
-            "dryrun"        => \$new_options{dryrun},
-            "v|verbose"     => \$new_options{verbose},
+            "o=i"                       =>  \$new_options{nodefile_offset},
+            "no=i"                      =>  \$new_options{node_offset},
+            "N=i"                       =>  \$new_options{num_nodes},
+            "n|np=i"                    =>  \$new_options{num_ranks}, 
+            "tpp|threads-per-process=i" =>  \$new_options{tpp}, 
+            "npernode=i"                =>  \$new_options{npernode},
+            "switches=s"                =>  \$new_options{user_mpirun_switches},
+            "bp|binding-policy=s"       =>  \$new_options{binding_policy},
+            "bl|binding-level=s"        =>  \$new_options{binding_level},
+            "nodefile|machinefile=s"    =>  \$new_options{nodefile},
+            "dryrun"                    =>  \$new_options{dryrun},
+            "v|verbose"                 =>  \$new_options{verbose},
         );
     }
 
     ### Check the consistency of user-provided options before doing anything
     #
-    # Hybrid jobs (those which do not run one MPI rank per core) can be 
+    # Hybrid jobs (those which do not run one MPI process per core) can be 
     # specified in several ways:
     #
     #   1. Specifying -N and -n (a la Slurm)
     #   2. Specifying -N and -npernode (a la OpenMPI)
     #   3. Just -n (let the RM pick up the -N)
     #   4. Just -npernode (let the RM pick up the -N)
-    #   5. Specifying -n and -tpr (hope that n*tpr < N*ppn)
+    #   5. Specifying -n and -tpp (hope that n*tpp < N*ppn)
     #
     #   Thus, if neither -npernode nor -n are provided, this is not a hybrid 
     # job.  In all cases, rm_num_ranks should probably be ignored.  As long as
     # we can gaurantee that num_nodes and npernode are defined by the end of
-    # get_options(), we can calculate num_ranks.
+    # get_options_user(), we can calculate num_ranks.
     #
     #   In the event that npernode is negative (i.e., not all nodes have the
     # same loading due to num_ranks%npernode != 0), num_ranks is already 
@@ -669,13 +645,13 @@ sub get_options
         bailout( 1, "Your number of nodes (-N) must be greater than zero.\n" );
     }
     if ( $new_options{num_ranks} && $new_options{num_ranks} <= 0 ) {
-        bailout( 1, "Your number of ranks (-n) must be greater than zero.\n" );
+        bailout( 1, "Your number of processes (-n) must be greater than zero.\n" );
     }
     if ( $new_options{npernode} && $new_options{npernode} <= 0 ) {
-        bailout( 1, "Your ranks per node (--npernode) must be greater than zero.\n" );
+        bailout( 1, "Your processes per node (--npernode) must be greater than zero.\n" );
     }
-    if ( $new_options{tpr} && $new_options{tpr} <= 0 ) {
-        bailout( 1, "Your threads per rank (-tpr) must be greater than zero.\n" );
+    if ( $new_options{tpp} && $new_options{tpp} <= 0 ) {
+        bailout( 1, "Your threads per process (-tpp) must be greater than zero.\n" );
     }
 
     # Check for a valid binding policy/level
@@ -715,7 +691,7 @@ sub get_options
 
     # Merge in the user-provided values with the pre-set values.  Overwrite old
     # pre-set values with user-provided when duplicates occur.
-    my %options = ( %$old_options, %new_options );
+    $options = [ %old_options, %new_options ];
 
     ### If user did not specify certain parameters, copy the values from what
     ### the resource manager (rm) provided
@@ -743,7 +719,7 @@ sub get_options
         }
     }
 
-    # how many MPI ranks total the job will use
+    # how many MPI processes total the job will use
     if ( !$options{num_ranks} ) {
         if ( $options{num_nodes} == $options{rm_num_nodes} ) {
             dprintf( "Using default num_ranks for now...\n" );
@@ -757,7 +733,7 @@ sub get_options
         }
     }
 
-    # how many MPI ranks PER NODE the job will use.  If this is NEGATIVE, then 
+    # how many MPI processes PER NODE the job will use.  If this is NEGATIVE, then 
     # the division is uneven and the node breakdown requires a lot more logic,
     # so flag the npernode parameter and let gen_hostfile() do that
     my $remainder = $options{num_ranks} % $options{num_nodes};
@@ -777,6 +753,7 @@ sub get_options
         $options{npernode} = -1 * floor($options{num_ranks} 
                                 / $options{num_nodes});
     }
+
     # recalculate num_ranks in case user specified -N which is less than 
     # rm_num_nodes.  if npernode is negative though, leave it alone since
     # an imbalance of ranks per node can only occur if the user specified
@@ -811,8 +788,8 @@ sub get_options
             $options);
     }
 
-    if ( $options{tpr} 
-    &&  ($options{num_ranks}*$options{tpr}) 
+    if ( $options{tpp} 
+    &&  ($options{num_ranks}*$options{tpp}) 
             > ($options{num_nodes}*$options{rm_ppn}) ) 
     {
         ibrun_warn("Your job will use %d ranks, "
@@ -820,8 +797,8 @@ sub get_options
         . "and %d cores per node (%d total).  Some cores will be "
         . "overloaded as a result.\n",
             $options{num_ranks},
-            $options{tpr},
-            $options{num_ranks}*$options{tpr},
+            $options{tpp},
+            $options{num_ranks}*$options{tpp},
             $options{num_nodes},
             $options{rm_ppn}, 
             $options{num_nodes}*$options{rm_ppn});
@@ -839,8 +816,47 @@ sub get_options
 }
 
 ################################################################################
+### get_mpi_stack - detect the loaded MPI implementation from the modules
+###     environment
+################################################################################
+sub get_mpi_stack
+{
+    if ( $ENV{LOADEDMODULES} ) {
+        my @modules = split( m/:/, $ENV{LOADEDMODULES} );
+        foreach my $module ( @modules ) {
+            my ($modname, $modvers) = split(m{/}, $module);
+            if ( $modname eq 'mvapich2_ib' 
+            ||   $modname eq 'mv2profile_ib' ) {
+                $options->{mpi_stack} = "mvapich2";
+                $options->{mpi_launcher} = "mpirun_rsh";
+                $options->{mpi_version} = $modvers;
+                last;
+            }
+            elsif ( $modname eq 'openmpi_ib' ) {
+                $options->{mpi_stack} = "openmpi";
+                $options->{mpi_launcher} = "orterun";
+                $options->{mpi_version} = $modvers;
+                last;
+            }
+            elsif ( $modname =~ m/mpich2_ib/ ) {
+                $options->{mpi_stack} = "mpich2";
+                $options->{mpi_launcher} = "mpiexec.hydra";
+                $options->{mpi_version} = $modvers;
+                last;
+            }
+        }
+        unless ( $options->{mpi_stack} ) {
+            bailout(5, "No recognized MPI modules appear to be loaded.  Load an MPI module before using ibrun.\n" );
+        }
+    }
+    else {
+        bailout(5, "\$LOADEDMODULES is not set.  You must load an MPI module before using ibrun.\n" );
+    }
+}
+
+################################################################################
 ### bailout: terminate with an error and optionally delete the temporary 
-### nodefile created by ibrun
+###     nodefile created by ibrun
 ################################################################################
 sub bailout
 {
@@ -901,7 +917,7 @@ ibrun [options] <executable> [executable args]
     --npernode <n>
         only launch n MPI ranks per node (default: ppn from resource manager)
 
-    --tpr|--tpp|--threads-per-rank|--threads-per-process <n>
+    --tpp|--threads-per-rank|--threads-per-process <n>
         how many threads each MPI rank (often referred to as 'MPI process') 
         will spawn.  (default: $OMP_NUM_THREADS (if defined), <ppn>/<npernode>
         if ppn is divisible by npernode, or 1 otherwise)
